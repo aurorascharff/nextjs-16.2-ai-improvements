@@ -1,7 +1,7 @@
 "use client";
 
 import { useOptimistic, useTransition } from "react";
-import { useRouter } from "next/navigation";
+import Link from "next/link";
 
 const categories = [
   { label: "All", value: "" },
@@ -11,7 +11,6 @@ const categories = [
 ];
 
 export function CategoryFilter({ active }: { active?: string }) {
-  const router = useRouter();
   const [isPending, startTransition] = useTransition();
   const [optimisticCategory, setOptimisticCategory] = useOptimistic(
     active ?? ""
@@ -22,12 +21,12 @@ export function CategoryFilter({ active }: { active?: string }) {
       {categories.map((cat) => {
         const isActive = cat.value === optimisticCategory;
         return (
-          <button
+          <Link
             key={cat.value}
+            href={cat.value ? `/?category=${cat.value}` : "/"}
             onClick={() => {
               startTransition(() => {
                 setOptimisticCategory(cat.value);
-                router.push(cat.value ? `/?category=${cat.value}` : "/");
               });
             }}
             className={`rounded-full px-3 py-1 text-sm transition-colors ${
@@ -37,7 +36,7 @@ export function CategoryFilter({ active }: { active?: string }) {
             }`}
           >
             {cat.label}
-          </button>
+          </Link>
         );
       })}
     </div>

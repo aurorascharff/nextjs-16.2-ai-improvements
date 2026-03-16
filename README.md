@@ -44,7 +44,7 @@ next-browser ppr lock
 next-browser errors
 ```
 
-Requires `cacheComponents: true` in `next.config.ts` for PPR commands (already configured).
+PPR commands (`ppr lock`/`ppr unlock`) require `cacheComponents: true` in `next.config.ts`.
 
 ## Links
 
