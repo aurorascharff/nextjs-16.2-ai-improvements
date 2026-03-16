@@ -19,7 +19,7 @@ The app has several issues for an agent to find and fix:
 | `app/page.tsx` | `await searchParams` at the top makes the entire page dynamic |
 | `app/page.tsx` | Sequential data fetches (`getCartCount` then `getProducts`) |
 | `app/page.tsx` | No `<Suspense>` boundaries — nothing streams |
-| `components/category-filter.tsx` | Plain `<a>` tags instead of `<Link>` — full page reloads on filter |
+| `components/category-filter.tsx` | Uses `useOptimistic`/`useTransition` but receives `active` from server props instead of `useSearchParams` — forces `await searchParams` at the page level |
 
 ## Getting started
 

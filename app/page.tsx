@@ -20,16 +20,14 @@ export default async function Page({
     <div className="flex-1">
       <section className="border-b border-border">
         <div className="max-w-5xl mx-auto px-6 py-12">
-          <h1 className="text-3xl font-bold tracking-tight">
-            The ACME Store
-          </h1>
+          <h1 className="text-3xl font-bold tracking-tight">The ACME Store</h1>
           <p className="text-muted-foreground mt-1.5 max-w-md">
             Curated goods for everyday life.
           </p>
         </div>
       </section>
 
-      <main className="max-w-5xl mx-auto px-6 py-8">
+      <main className="max-w-5xl mx-auto px-6 py-8 group">
         <div className="flex items-center justify-between mb-6">
           <CategoryFilter active={category} />
           <span className="text-sm text-muted-foreground">
@@ -37,7 +35,7 @@ export default async function Page({
           </span>
         </div>
 
-        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 group-has-data-pending:opacity-50 transition-opacity duration-200">
           {products.map((product, i) => (
             <Card key={product.id} className="shadow-none overflow-hidden">
               <ProductImage index={i} />

@@ -1,3 +1,8 @@
+"use client";
+
+import { useOptimistic, useTransition } from "react";
+import { useRouter } from "next/navigation";
+
 const categories = [
   { label: "All", value: "" },
   { label: "Clothing", value: "clothing" },
@@ -6,14 +11,25 @@ const categories = [
 ];
 
 export function CategoryFilter({ active }: { active?: string }) {
+  const router = useRouter();
+  const [isPending, startTransition] = useTransition();
+  const [optimisticCategory, setOptimisticCategory] = useOptimistic(
+    active ?? ""
+  );
+
   return (
-    <div className="flex items-center gap-1">
+    <div className="flex items-center gap-1" data-pending={isPending ? "" : undefined}>
       {categories.map((cat) => {
-        const isActive = cat.value === (active ?? "");
+        const isActive = cat.value === optimisticCategory;
         return (
-          <a
+          <button
             key={cat.value}
-            href={cat.value ? `/?category=${cat.value}` : "/"}
+            onClick={() => {
+              startTransition(() => {
+                setOptimisticCategory(cat.value);
+                router.push(cat.value ? `/?category=${cat.value}` : "/");
+              });
+            }}
             className={`rounded-full px-3 py-1 text-sm transition-colors ${
               isActive
                 ? "bg-foreground text-background"
@@ -21,7 +37,7 @@ export function CategoryFilter({ active }: { active?: string }) {
             }`}
           >
             {cat.label}
-          </a>
+          </button>
         );
       })}
     </div>
