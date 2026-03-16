@@ -1,7 +1,3 @@
-"use client";
-
-import Link from "next/link";
-
 const categories = [
   { label: "All", value: "" },
   { label: "Clothing", value: "clothing" },
@@ -15,7 +11,7 @@ export function CategoryFilter({ active }: { active?: string }) {
       {categories.map((cat) => {
         const isActive = cat.value === (active ?? "");
         return (
-          <Link
+          <a
             key={cat.value}
             href={cat.value ? `/?category=${cat.value}` : "/"}
             className={`rounded-full px-3 py-1 text-sm transition-colors ${
@@ -25,7 +21,7 @@ export function CategoryFilter({ active }: { active?: string }) {
             }`}
           >
             {cat.label}
-          </Link>
+          </a>
         );
       })}
     </div>
