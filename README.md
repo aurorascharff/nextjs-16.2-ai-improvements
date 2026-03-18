@@ -30,15 +30,6 @@ Next.js 16.2 (canary) · React 19 · Tailwind CSS 4 · shadcn/ui
 | `app/page.tsx` | No `<Suspense>` boundaries — nothing streams |
 | `components/category-filter.tsx` | Uses `useOptimistic`/`useTransition` but receives `active` from server props instead of `useSearchParams` |
 
-## Expected fixes
-
-1. Move `cookies()` out of the layout into a `<Suspense>`-wrapped child component
-2. Switch `CategoryFilter` to `useSearchParams()` — remove `await searchParams` from page.tsx
-3. Wrap data fetches in separate `<Suspense>` boundaries so they stream independently
-4. Add skeleton fallbacks
-
-After fixing, the PPR static shell should show the nav, hero, filter bar, and footer instantly — with skeleton fallbacks where dynamic content streams in.
-
 ## Using next-browser
 
 ```bash
@@ -62,6 +53,10 @@ next-browser errors
 ```
 
 PPR commands require `cacheComponents: true` in `next.config.ts` (already enabled).
+
+## Example run
+
+See [FIXES.md](./FIXES.md) for a detailed writeup of an agent run that analyzed and fixed the anti-patterns.
 
 ## Links
 
