@@ -37,7 +37,7 @@ export default async function RootLayout({
     >
       <body className="min-h-full flex flex-col">
         <header className="border-b border-border">
-          <div className="max-w-5xl mx-auto px-6 flex items-center h-14 gap-4">
+          <div className="max-w-5xl mx-auto px-4 sm:px-6 flex items-center h-14 gap-4">
             <Link href="/" className="font-semibold text-sm tracking-tight">
               ACME
             </Link>
@@ -80,7 +80,7 @@ export default async function RootLayout({
         {children}
 
         <footer className="border-t border-border mt-auto">
-          <div className="max-w-5xl mx-auto px-6 py-8 flex items-center justify-between text-xs text-muted-foreground">
+          <div className="max-w-5xl mx-auto px-4 sm:px-6 py-6 sm:py-8 flex flex-col sm:flex-row items-center justify-between gap-3 text-xs text-muted-foreground">
             <span>&copy; 2026 ACME Inc.</span>
             <div className="flex gap-4">
               <span>Privacy</span>

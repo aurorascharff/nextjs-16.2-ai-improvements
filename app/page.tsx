@@ -19,16 +19,16 @@ export default async function Page({
   return (
     <div className="flex-1">
       <section className="border-b border-border">
-        <div className="max-w-5xl mx-auto px-6 py-12">
-          <h1 className="text-3xl font-bold tracking-tight">The ACME Store</h1>
+        <div className="max-w-5xl mx-auto px-4 sm:px-6 py-8 sm:py-12">
+          <h1 className="text-2xl sm:text-3xl font-bold tracking-tight">The ACME Store</h1>
           <p className="text-muted-foreground mt-1.5 max-w-md">
             Curated goods for everyday life.
           </p>
         </div>
       </section>
 
-      <main className="max-w-5xl mx-auto px-6 py-8 group">
-        <div className="flex items-center justify-between mb-6">
+      <main className="max-w-5xl mx-auto px-4 sm:px-6 py-6 sm:py-8 group">
+        <div className="flex flex-wrap items-center justify-between gap-3 mb-6">
           <CategoryFilter active={category} />
           <span className="text-sm text-muted-foreground">
             {cartCount} {cartCount === 1 ? "item" : "items"} in cart

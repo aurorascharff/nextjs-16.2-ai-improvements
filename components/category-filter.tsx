@@ -17,7 +17,7 @@ export function CategoryFilter({ active }: { active?: string }) {
   );
 
   return (
-    <div className="flex items-center gap-1" data-pending={isPending ? "" : undefined}>
+    <div className="flex items-center gap-1 overflow-x-auto" data-pending={isPending ? "" : undefined}>
       {categories.map((cat) => {
         const isActive = cat.value === optimisticCategory;
         return (
