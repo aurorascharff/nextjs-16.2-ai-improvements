@@ -25,7 +25,6 @@ A CLI that exposes browser-level data — screenshots, network requests, console
 
 ## The anti-patterns
 
-
 | File                             | Problem                                                                                                   |
 | -------------------------------- | --------------------------------------------------------------------------------------------------------- |
 | `app/layout.tsx`                 | `await cookies()` at the top blocks the entire layout from being static                                   |
@@ -33,7 +32,6 @@ A CLI that exposes browser-level data — screenshots, network requests, console
 | `app/page.tsx`                   | Sequential data fetches (`getCartCount` then `getProducts`)                                               |
 | `app/page.tsx`                   | No `<Suspense>` boundaries — nothing streams                                                              |
 | `components/category-filter.tsx` | Uses `useOptimistic`/`useTransition` but receives `active` from server props instead of `useSearchParams` |
-
 
 ## Using next-browser
 
