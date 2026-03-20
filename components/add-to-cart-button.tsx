@@ -8,6 +8,10 @@ export function AddToCartButton() {
   const [, action, pending] = useActionState(addToCart, undefined);
   const [added, setAdded] = useOptimistic(false);
 
+  // Uncomment to demo browser log forwarding (infinite render loop):
+  // const [count, setCount] = useState(0);
+  // setCount(count + 1);
+
   return (
     <Button
       size="sm"
