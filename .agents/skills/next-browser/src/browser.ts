@@ -14,7 +14,7 @@
 import { readFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { chromium, type BrowserContext, type Page } from "playwright";
+import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
 import { instant } from "@next/playwright";
 import * as componentTree from "./tree.ts";
 import * as suspenseTree from "./suspense.ts";
@@ -37,6 +37,23 @@ let context: BrowserContext | null = null;
 let page: Page | null = null;
 let profileDirPath: string | null = null;
 let initialOrigin: string | null = null;
+let ssrLocked = false;
+
+let previewBrowser: Browser | BrowserContext | null = null;
+let previewPage: Page | null = null;
+let previewImages: { caption?: string; imgData: string; timestamp: string }[] = [];
+
+/** Install or remove the script-blocking route handler based on ssrLocked. */
+async function syncSsrRoutes() {
+  if (!page) return;
+  await page.unrouteAll({ behavior: "wait" });
+  if (ssrLocked) {
+    await page.route("**/*", (route) => {
+      if (route.request().resourceType() === "script") return route.abort();
+      return route.continue();
+    });
+  }
+}
 
 // ── Browser lifecycle ────────────────────────────────────────────────────────
 
@@ -46,11 +63,12 @@ let initialOrigin: string | null = null;
  * reuse the existing context.
  */
 export async function open(url: string | undefined) {
-  if (!context) {
-    context = await launch();
-    page = context.pages()[0] ?? (await context.newPage());
-    net.attach(page);
+  if (context) {
+    await close();
   }
+  context = await launch();
+  page = context.pages()[0] ?? (await context.newPage());
+  net.attach(page);
   if (url) {
     initialOrigin = new URL(url).origin;
     await page!.goto(url, { waitUntil: "domcontentloaded" });
@@ -72,11 +90,16 @@ export async function cookies(cookies: { name: string; value: string }[], domain
 
 /** Close the browser and reset all state. */
 export async function close() {
+  await previewBrowser?.close().catch(() => {});
+  previewBrowser = null;
+  previewPage = null;
+  previewImages = [];
   await context?.close();
   context = null;
   page = null;
   release = null;
   settled = null;
+  ssrLocked = false;
   // Clean up temp profile directory.
   if (profileDirPath) {
     const { rmSync } = await import("node:fs");
@@ -102,7 +125,7 @@ let settled: Promise<void> | null = null;
 /** Enter PPR instant-navigation mode. The cookie is set immediately. */
 export function lock() {
   if (!page) throw new Error("browser not open");
-  if (release) throw new Error("already locked");
+  if (release) return Promise.resolve();
 
   return new Promise<void>((locked) => {
     settled = instant(page!, () => {
@@ -143,15 +166,9 @@ export async function unlock() {
   await stabilizeSuspenseState(page);
 
   // Capture what's suspended right now under the lock.
-  let locked = await suspenseTree.snapshot(page).catch(() => [] as suspenseTree.Boundary[]);
-
-  // For initial-load (goto) under lock, DevTools may not be connected —
-  // the shell uses a production-like renderer. Fall back to counting
-  // <template id="B:..."> elements in the DOM (PPR's Suspense placeholders).
-  const hasDevToolsData = locked.some((b) => b.parentID !== 0);
-  if (!hasDevToolsData) {
-    locked = await suspenseTree.snapshotFromDom(page);
-  }
+  // Under goto + lock, DevTools may not be connected (shell is static HTML).
+  // That's fine — we get all the rich data from the unlocked snapshot below.
+  const locked = await suspenseTree.snapshot(page).catch(() => [] as suspenseTree.Boundary[]);
 
   // Release the lock. instant() clears the cookie.
   // - push case: dynamic content streams in immediately (no reload)
@@ -161,15 +178,31 @@ export async function unlock() {
   await settled;
   settled = null;
 
+  // For goto case: the page auto-reloads. Wait for the new page to load
+  // and React/DevTools to reconnect before trying to snapshot boundaries.
+  await page.waitForLoadState("load").catch(() => {});
+  await waitForDevToolsReconnect(page);
+
   // Wait for all boundaries to resolve after unlock.
-  // Polls the DevTools suspense tree (works for both push and goto cases).
   await waitForSuspenseToSettle(page);
 
   // Capture the fully-resolved state with rich suspendedBy data.
   const unlocked = await suspenseTree.snapshot(page).catch(() => [] as suspenseTree.Boundary[]);
 
-  if (locked.length === 0 && unlocked.length === 0) return null;
-  return suspenseTree.formatAnalysis(unlocked, locked, origin);
+  if (locked.length === 0 && unlocked.length === 0) {
+    return { text: "No suspense boundaries detected.", boundaries: unlocked, locked, report: null };
+  }
+
+  const report = await suspenseTree.analyzeBoundaries(unlocked, locked, origin);
+  const pageMetadata = await nextMcp
+    .call(initialOrigin ?? origin, "get_page_metadata")
+    .catch(() => null);
+  if (pageMetadata) {
+    suspenseTree.annotateReportWithPageMetadata(report, pageMetadata);
+  }
+
+  const text = suspenseTree.formatReport(report);
+  return { text, boundaries: unlocked, locked, report };
 }
 
 /**
@@ -220,6 +253,47 @@ async function waitForSuspenseToSettle(p: Page) {
   }
 }
 
+/**
+ * Wait for React DevTools to reconnect after a page reload.
+ *
+ * After the goto case unlocks, the page auto-reloads and DevTools loses its
+ * renderer connection. Poll until the DevTools hook reports at least one
+ * renderer, or bail after 5s. This replaces the old hardcoded 2s sleep.
+ */
+async function waitForDevToolsReconnect(p: Page) {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    const connected = await p.evaluate(() => {
+      const hook = (window as any).__REACT_DEVTOOLS_GLOBAL_HOOK__;
+      return hook?.rendererInterfaces?.size > 0;
+    }).catch(() => false);
+    if (connected) return;
+    await new Promise((r) => setTimeout(r, 200));
+  }
+}
+
+// ── SSR lock/unlock ──────────────────────────────────────────────────────────
+//
+// While SSR-locked, every navigation blocks external script resources so the
+// page renders only the server-side HTML shell (no React hydration, no client
+// bundles). Useful for inspecting raw SSR output across multiple navigations.
+
+/** Enter SSR-locked mode. All subsequent navigations block external scripts. */
+export async function ssrLock() {
+  if (!page) throw new Error("browser not open");
+  if (ssrLocked) return;
+  ssrLocked = true;
+  await syncSsrRoutes();
+}
+
+/** Exit SSR-locked mode. Re-enables external scripts. */
+export async function ssrUnlock() {
+  if (!page) throw new Error("browser not open");
+  if (!ssrLocked) return;
+  ssrLocked = false;
+  await syncSsrRoutes();
+}
+
 // ── Navigation ───────────────────────────────────────────────────────────────
 
 /** Hard reload the current page. Returns the URL after reload. */
@@ -230,68 +304,137 @@ export async function reload() {
 }
 
 /**
- * Reload the page while capturing screenshots every ~150ms.
- * Stops when: load has fired AND no new layout-shift entries for 2s.
- * Hard timeout at 30s. Returns the list of screenshot paths plus any
- * LayoutShift entries observed during the reload.
- */
-/**
- * Lock PPR → goto → screenshot the shell → unlock → screenshot frames
- * until the page settles. Just PNGs in a directory — the AI reads them.
+ * Profile a page load: reload (or navigate to a URL) and collect Core Web
+ * Vitals (LCP, CLS, TTFB) plus React hydration timing.
  *
- * Frame 0 is always the PPR shell. Remaining frames capture the transition
- * through hydration and data loading. Stops after 3s of no visual change.
+ * CWVs come from PerformanceObserver and Navigation Timing API.
+ * Hydration timing comes from console.timeStamp entries emitted by React's
+ * profiling build (see the addInitScript interceptor in launch()).
+ *
+ * Returns structured data that the CLI formats into a readable report.
  */
-export async function captureGoto(url?: string) {
+export async function perf(url?: string) {
   if (!page) throw new Error("browser not open");
   const targetUrl = url || page.url();
-  const dir = join(tmpdir(), `next-browser-capture-goto-${Date.now()}`);
-  mkdirSync(dir, { recursive: true });
 
-  let frameIdx = 0;
+  // Install CWV observers before navigation so they capture everything.
+  await page.evaluate(() => {
+    (window as any).__NEXT_BROWSER_REACT_TIMING__ = [];
+    const cwv: any = { lcp: null, cls: 0, clsEntries: [] };
+    (window as any).__NEXT_BROWSER_CWV__ = cwv;
 
-  async function snap() {
-    const path = join(dir, `frame-${String(frameIdx).padStart(4, "0")}.png`);
-    const buf = await page!.screenshot({ path }).catch(() => null);
-    frameIdx++;
-    return buf;
+    // Largest Contentful Paint
+    new PerformanceObserver((list) => {
+      const entries = list.getEntries();
+      if (entries.length > 0) {
+        const last = entries[entries.length - 1] as any;
+        cwv.lcp = {
+          startTime: Math.round(last.startTime * 100) / 100,
+          size: last.size,
+          element: last.element?.tagName?.toLowerCase() ?? null,
+          url: last.url || null,
+        };
+      }
+    }).observe({ type: "largest-contentful-paint", buffered: true });
+
+    // Cumulative Layout Shift
+    new PerformanceObserver((list) => {
+      for (const entry of list.getEntries() as any[]) {
+        if (!entry.hadRecentInput) {
+          cwv.cls += entry.value;
+          cwv.clsEntries.push({
+            value: Math.round(entry.value * 10000) / 10000,
+            startTime: Math.round(entry.startTime * 100) / 100,
+          });
+        }
+      }
+    }).observe({ type: "layout-shift", buffered: true });
+  });
+
+  // Navigate or reload to trigger a full page load.
+  if (url) {
+    await page.goto(targetUrl, { waitUntil: "load" });
+  } else {
+    await page.reload({ waitUntil: "load" });
   }
 
-  // PPR shell: lock suppresses hydration.
-  await lock();
-  await page.goto(targetUrl, { waitUntil: "load" }).catch(() => {});
-  await new Promise((r) => setTimeout(r, 300));
-  await snap();
+  // Wait for passive effects, late paints, and layout shifts to flush.
+  await new Promise((r) => setTimeout(r, 3000));
 
-  // Unlock → page reloads, hydrates, loads data.
-  const unlockDone = unlock();
-  await new Promise((r) => setTimeout(r, 200));
+  // Collect all metrics from the page.
+  const metrics = await page.evaluate(() => {
+    const cwv = (window as any).__NEXT_BROWSER_CWV__ ?? {};
+    const timing = (window as any).__NEXT_BROWSER_REACT_TIMING__ ?? [];
 
-  let lastChangeTime = Date.now();
-  let prevHash = "";
-  const SETTLE_MS = 3_000;
-  const HARD_TIMEOUT = 30_000;
-  const start = Date.now();
+    // TTFB from Navigation Timing API.
+    const nav = performance.getEntriesByType("navigation")[0] as PerformanceNavigationTiming | undefined;
+    const ttfb = nav
+      ? Math.round((nav.responseStart - nav.requestStart) * 100) / 100
+      : null;
 
-  while (true) {
-    const buf = await snap();
+    return { cwv, timing, ttfb };
+  }) as {
+    cwv: {
+      lcp: { startTime: number; size: number; element: string | null; url: string | null } | null;
+      cls: number;
+      clsEntries: { value: number; startTime: number }[];
+    };
+    timing: Array<{
+      label: string;
+      startTime: number;
+      endTime: number;
+      track: string;
+      trackGroup: string;
+      color: string;
+    }>;
+    ttfb: number | null;
+  };
 
-    let hash = "";
-    if (buf) {
-      let h = 0;
-      for (let i = 0; i < buf.length; i += 200) h = ((h << 5) - h + buf[i]) | 0;
-      hash = String(h);
-    }
-    if (hash !== prevHash) { lastChangeTime = Date.now(); prevHash = hash; }
+  // Process React hydration timing.
+  const phases = metrics.timing.filter((e) => e.trackGroup === "Scheduler ⚛" && e.endTime > e.startTime);
+  const components = metrics.timing.filter((e) => e.track === "Components ⚛" && e.endTime > e.startTime);
+  const hydrationPhases = phases.filter((e) => e.label === "Hydrated");
+  const hydratedComponents = components.filter((e) => e.color?.startsWith("tertiary"));
 
-    if (Date.now() - start > HARD_TIMEOUT) break;
-    if (lastChangeTime > 0 && Date.now() - lastChangeTime > SETTLE_MS) break;
-
-    await new Promise((r) => setTimeout(r, 150));
+  let hydrationStart = Infinity;
+  let hydrationEnd = 0;
+  for (const p of hydrationPhases) {
+    if (p.startTime < hydrationStart) hydrationStart = p.startTime;
+    if (p.endTime > hydrationEnd) hydrationEnd = p.endTime;
   }
 
-  await unlockDone.catch(() => {});
-  return { dir, frames: frameIdx };
+  const round = (n: number) => Math.round(n * 100) / 100;
+
+  return {
+    url: targetUrl,
+    ttfb: metrics.ttfb,
+    lcp: metrics.cwv.lcp,
+    cls: {
+      score: round(metrics.cwv.cls),
+      entries: metrics.cwv.clsEntries,
+    },
+    hydration: hydrationPhases.length > 0
+      ? {
+          startTime: round(hydrationStart),
+          endTime: round(hydrationEnd),
+          duration: round(hydrationEnd - hydrationStart),
+        }
+      : null,
+    phases: phases.map((p) => ({
+      label: p.label,
+      startTime: round(p.startTime),
+      endTime: round(p.endTime),
+      duration: round(p.endTime - p.startTime),
+    })),
+    hydratedComponents: hydratedComponents
+      .map((c) => ({
+        name: c.label,
+        startTime: round(c.startTime),
+        endTime: round(c.endTime),
+        duration: round(c.endTime - c.startTime),
+      }))
+      .sort((a, b) => b.duration - a.duration),
+  };
 }
 
 /**
@@ -364,10 +507,10 @@ export async function push(path: string) {
 
 /** Full-page navigation (new document load). Resolves relative URLs against the current page. */
 export async function goto(url: string) {
-  if (!page) throw new Error("browser not open");
-  const target = new URL(url, page.url()).href;
+  if (!page) await open(undefined);
+  const target = new URL(url, page!.url()).href;
   initialOrigin = new URL(target).origin;
-  await page.goto(target, { waitUntil: "domcontentloaded" });
+  await page!.goto(target, { waitUntil: "domcontentloaded" });
   return target;
 }
 
@@ -429,19 +572,270 @@ async function formatSource([file, line, col]: [string, number, number]) {
 
 // ── Utilities ────────────────────────────────────────────────────────────────
 
-/** Full-page screenshot saved to a temp file. Returns the file path. */
-export async function screenshot() {
+/** Take a screenshot and display it in a separate headed Chromium window.
+ *  Images accumulate across calls — use `clear` to reset. */
+export async function preview(caption?: string, clear?: boolean) {
   if (!page) throw new Error("browser not open");
+  if (clear) previewImages = [];
+
+  const path = await screenshot();
+  const imgData = readFileSync(path).toString("base64");
+  const timestamp = new Date().toLocaleTimeString();
+  previewImages.unshift({ caption, imgData, timestamp });
+
+  const imagesHtml = previewImages
+    .map(
+      (img) =>
+        `<div style="padding:4px 12px;display:flex;align-items:baseline;gap:8px">` +
+        (img.caption
+          ? `<span style="font-size:14px">${escapeHtml(img.caption)}</span>`
+          : "") +
+        `<span style="font-size:11px;opacity:0.5">${escapeHtml(img.timestamp)}</span>` +
+        `</div>` +
+        `<img src="data:image/png;base64,${img.imgData}" style="display:block;max-width:100%">`,
+    )
+    .join(`<hr style="border:none;border-top:1px solid #333;margin:12px 0">`);
+
+  const html =
+    `<html><head><title>next-browser preview</title></head>` +
+    `<body style="margin:0;background:#111;color:#fff;font-family:system-ui">` +
+    `<div style="padding:8px 12px;font-size:11px;opacity:0.5;text-transform:uppercase;letter-spacing:0.05em">next-browser preview</div>` +
+    `${imagesHtml}` +
+    `</body></html>`;
+  const htmlPath = path.replace(/\.png$/, ".html");
+  writeFileSync(htmlPath, html);
+  const target = `file://${htmlPath}`;
+
+  // Reuse existing preview window, or launch a new one.
+  if (previewPage && !previewPage.isClosed()) {
+    try {
+      await previewPage.goto(target);
+      await previewPage.bringToFront();
+      return path;
+    } catch {
+      // Window was closed by user — fall through to launch a new one.
+      await previewBrowser?.close().catch(() => {});
+    }
+  }
+
+  const { mkdtempSync } = await import("node:fs");
   const { join } = await import("node:path");
   const { tmpdir } = await import("node:os");
-  const path = join(tmpdir(), `next-browser-${Date.now()}.png`);
-  await page.screenshot({ path, fullPage: true });
+  const userDataDir = mkdtempSync(join(tmpdir(), "nb-preview-"));
+  const ctx = await chromium.launchPersistentContext(userDataDir, {
+    headless: false,
+    args: [`--app=${target}`, "--window-size=820,640"],
+    viewport: null,
+  });
+  previewBrowser = ctx;
+  previewPage = ctx.pages()[0] ?? (await ctx.waitForEvent("page"));
+  await previewPage.waitForLoadState();
+  await previewPage.bringToFront();
   return path;
 }
 
-/** Evaluate arbitrary JavaScript in the page context. */
-export async function evaluate(script: string) {
+function escapeHtml(s: string) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+/** Screenshot saved to a temp file. Returns the file path. */
+export async function screenshot(opts?: { fullPage?: boolean }) {
   if (!page) throw new Error("browser not open");
+  await hideDevOverlay();
+  const { join } = await import("node:path");
+  const { tmpdir } = await import("node:os");
+  const path = join(tmpdir(), `next-browser-${Date.now()}.png`);
+  await page.screenshot({ path, fullPage: opts?.fullPage });
+  return path;
+}
+
+/** Remove Next.js devtools overlay from the page before screenshots. */
+async function hideDevOverlay() {
+  if (!page) return;
+  await page.evaluate(() => {
+    document.querySelectorAll("[data-nextjs-dev-overlay]").forEach((el) => el.remove());
+  }).catch(() => {});
+}
+
+// ── Ref map for interactive elements ──────────────────────────────────
+
+const INTERACTIVE_ROLES = new Set([
+  "button", "link", "textbox", "checkbox", "radio", "combobox", "listbox",
+  "menuitem", "menuitemcheckbox", "menuitemradio", "option", "searchbox",
+  "slider", "spinbutton", "switch", "tab", "treeitem",
+]);
+
+type Ref = { role: string; name: string; nth?: number };
+let refMap: Ref[] = [];
+
+type CDPAXNode = {
+  nodeId: string;
+  role: { type: string; value: string };
+  name?: { type: string; value: string };
+  properties?: { name: string; value: { type: string; value: unknown } }[];
+  childIds?: string[];
+  backendDOMNodeId?: number;
+};
+
+/**
+ * Snapshot the accessibility tree via CDP and return a text representation
+ * with [ref=e0], [ref=e1] … markers on interactive elements.
+ * Stores a ref map so that `click("e3")` can resolve back to role+name.
+ */
+export async function snapshot() {
+  if (!page) throw new Error("browser not open");
+
+  const cdp = await page.context().newCDPSession(page);
+  try {
+    const { nodes } = (await cdp.send("Accessibility.getFullAXTree" as never)) as {
+      nodes: CDPAXNode[];
+    };
+
+    // Index nodes by ID
+    const byId = new Map<string, CDPAXNode>();
+    for (const n of nodes) byId.set(n.nodeId, n);
+
+    refMap = [];
+    const roleNameCount = new Map<string, number>();
+    const lines: string[] = [];
+
+    function walk(node: CDPAXNode, depth: number) {
+      const role = node.role?.value || "unknown";
+      const name = (node.name?.value || "").trim().slice(0, 80);
+      const isInteractive = INTERACTIVE_ROLES.has(role);
+
+      // Read properties into a map
+      const propMap = new Map<string, unknown>();
+      for (const p of node.properties || []) propMap.set(p.name, p.value.value);
+
+      const ignored = propMap.get("hidden") === true;
+      if (ignored) return;
+
+      // Always skip leaf text nodes — parent already carries the text
+      if (role === "InlineTextBox" || role === "StaticText" || role === "LineBreak") return;
+
+      // Skip generic/none wrappers with no name — just recurse children
+      const SKIP_ROLES = new Set(["none", "generic", "GenericContainer"]);
+      if (SKIP_ROLES.has(role) && !name) {
+        for (const id of node.childIds || []) {
+          const child = byId.get(id);
+          if (child) walk(child, depth);
+        }
+        return;
+      }
+
+      // Skip root WebArea — just recurse
+      if (role === "WebArea" || role === "RootWebArea") {
+        for (const id of node.childIds || []) {
+          const child = byId.get(id);
+          if (child) walk(child, depth);
+        }
+        return;
+      }
+
+      const indent = "  ".repeat(depth);
+      let line = `${indent}- ${role}`;
+      if (name) line += ` "${name}"`;
+
+      const disabled = propMap.get("disabled") === true;
+
+      if (isInteractive && !disabled) {
+        const key = `${role}::${name}`;
+        const count = roleNameCount.get(key) || 0;
+        roleNameCount.set(key, count + 1);
+
+        const ref: Ref = { role, name };
+        if (count > 0) ref.nth = count;
+        const idx = refMap.length;
+        refMap.push(ref);
+        line += ` [ref=e${idx}]`;
+      }
+
+      // Append state properties
+      const tags: string[] = [];
+      if (propMap.get("checked") === "true" || propMap.get("checked") === true) tags.push("checked");
+      if (propMap.get("checked") === "mixed") tags.push("mixed");
+      if (disabled) tags.push("disabled");
+      if (propMap.get("expanded") === true) tags.push("expanded");
+      if (propMap.get("expanded") === false) tags.push("collapsed");
+      if (propMap.get("selected") === true) tags.push("selected");
+      if (tags.length) line += ` (${tags.join(", ")})`;
+
+      lines.push(line);
+      for (const id of node.childIds || []) {
+        const child = byId.get(id);
+        if (child) walk(child, depth + 1);
+      }
+    }
+
+    // Start from the root (first node)
+    if (nodes.length) walk(nodes[0], 0);
+    return lines.join("\n");
+  } finally {
+    await cdp.detach();
+  }
+}
+
+/** Resolve a ref (e.g. "e3") or selector string to a Playwright Locator. */
+function resolveLocator(selectorOrRef: string) {
+  if (!page) throw new Error("browser not open");
+
+  const refMatch = selectorOrRef.match(/^e(\d+)$/);
+  if (refMatch) {
+    const idx = Number(refMatch[1]);
+    const ref = refMap[idx];
+    if (!ref) throw new Error(`ref e${idx} not found — run snapshot first`);
+    const locator = page.getByRole(ref.role as Parameters<Page["getByRole"]>[0], {
+      name: ref.name,
+      exact: true,
+    });
+    return ref.nth != null ? locator.nth(ref.nth) : locator;
+  }
+
+  const hasPrefix = /^(css=|text=|role=|#|\[|\.|\w+\s*>)/.test(selectorOrRef);
+  return page.locator(hasPrefix ? selectorOrRef : `text=${selectorOrRef}`);
+}
+
+/**
+ * Click an element using real pointer events.
+ * Accepts: "e3" (ref from snapshot), plain text, or Playwright selectors.
+ */
+export async function click(selectorOrRef: string) {
+  if (!page) throw new Error("browser not open");
+  await resolveLocator(selectorOrRef).click();
+}
+
+/**
+ * Fill a text input/textarea. Clears existing value, then types the new one.
+ * Accepts: "e3" (ref from snapshot), or a selector.
+ */
+export async function fill(selectorOrRef: string, value: string) {
+  if (!page) throw new Error("browser not open");
+  await resolveLocator(selectorOrRef).fill(value);
+}
+
+/**
+ * Evaluate arbitrary JavaScript in the page context.
+ * If ref is provided (e.g. "e3"), the script receives the DOM element as its
+ * first argument: `next-browser eval e3 'el => el.textContent'`
+ */
+export async function evaluate(script: string, ref?: string) {
+  if (!page) throw new Error("browser not open");
+  if (ref) {
+    const locator = resolveLocator(ref);
+    const handle = await locator.elementHandle();
+    if (!handle) throw new Error(`ref ${ref} not found in DOM`);
+    // The script should be an arrow/function that receives the element.
+    // We wrap it so page.evaluate can pass the element handle as an arg.
+    return page.evaluate(
+      ([fn, el]) => {
+        // eslint-disable-next-line no-eval
+        const f = (0, eval)(fn);
+        return f(el);
+      },
+      [script, handle] as const,
+    );
+  }
   return page.evaluate(script);
 }
 
@@ -531,10 +925,46 @@ async function launch() {
 
   const ctx = await chromium.launchPersistentContext(dir, {
     headless,
-    viewport: { width: 1440, height: 900 },
+    viewport: null,
     // --no-sandbox is required when Chrome runs as root (common in containers/cloud sandboxes)
-    args: headless ? ["--no-sandbox"] : [],
+    args: [
+      ...(headless ? ["--no-sandbox"] : []),
+      "--window-size=1440,900",
+    ],
   });
   await ctx.addInitScript(installHook);
+
+  // Intercept console.timeStamp to capture React's Performance Track entries.
+  // React's profiling build calls console.timeStamp(label, startTime, endTime,
+  // track, trackGroup, color) for render phases and per-component timing.
+  // startTime/endTime are performance.now() values from the reconciler.
+  await ctx.addInitScript(() => {
+    const entries: Array<{
+      label: string;
+      startTime: number;
+      endTime: number;
+      track: string;
+      trackGroup?: string;
+      color?: string;
+    }> = [];
+    (window as any).__NEXT_BROWSER_REACT_TIMING__ = entries;
+    const orig = console.timeStamp;
+    console.timeStamp = function (label?: string, ...args: any[]) {
+      if (typeof label === "string" && args.length >= 2 && typeof args[0] === "number") {
+        entries.push({
+          label,
+          startTime: args[0],
+          endTime: args[1],
+          track: args[2] ?? "",
+          trackGroup: args[3] ?? "",
+          color: args[4] ?? "",
+        });
+      }
+      return orig.apply(console, [label, ...args] as any);
+    };
+  });
+
+  // Next.js devtools overlay is removed before each screenshot via hideDevOverlay().
+
   return ctx;
 }

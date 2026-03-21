@@ -50,11 +50,16 @@ type Cmd = {
   tool?: string;
   args?: Record<string, unknown>;
   script?: string;
+  selector?: string;
+  value?: string;
   idx?: number;
   cookies?: { name: string; value: string }[];
   domain?: string;
   width?: number | null;
   height?: number | null;
+  fullPage?: boolean;
+  caption?: string;
+  clear?: boolean;
 };
 
 async function run(cmd: Cmd) {
@@ -78,16 +83,20 @@ async function run(cmd: Cmd) {
     const data = await browser.reload();
     return { ok: true, data };
   }
-  if (cmd.action === "capture-goto") {
-    const data = await browser.captureGoto(cmd.url as string | undefined);
+  if (cmd.action === "perf") {
+    const data = await browser.perf(cmd.url as string | undefined);
     return { ok: true, data };
   }
   if (cmd.action === "restart") {
     const data = await browser.restart();
     return { ok: true, data };
   }
+  if (cmd.action === "preview") {
+    const data = await browser.preview(cmd.caption, cmd.clear);
+    return { ok: true, data };
+  }
   if (cmd.action === "screenshot") {
-    const data = await browser.screenshot();
+    const data = await browser.screenshot({ fullPage: cmd.fullPage });
     return { ok: true, data };
   }
   if (cmd.action === "links") {
@@ -102,6 +111,14 @@ async function run(cmd: Cmd) {
     const data = await browser.goto(cmd.url!);
     return { ok: true, data };
   }
+  if (cmd.action === "ssr-lock") {
+    await browser.ssrLock();
+    return { ok: true };
+  }
+  if (cmd.action === "ssr-unlock") {
+    await browser.ssrUnlock();
+    return { ok: true };
+  }
   if (cmd.action === "back") {
     await browser.back();
     return { ok: true };
@@ -114,8 +131,20 @@ async function run(cmd: Cmd) {
     const data = await browser.node(cmd.nodeId!);
     return { ok: true, data };
   }
+  if (cmd.action === "snapshot") {
+    const data = await browser.snapshot();
+    return { ok: true, data };
+  }
+  if (cmd.action === "click") {
+    await browser.click(cmd.selector!);
+    return { ok: true };
+  }
+  if (cmd.action === "fill") {
+    await browser.fill(cmd.selector!, cmd.value!);
+    return { ok: true };
+  }
   if (cmd.action === "eval") {
-    const data = await browser.evaluate(cmd.script!);
+    const data = await browser.evaluate(cmd.script!, cmd.selector);
     return { ok: true, data };
   }
   if (cmd.action === "mcp") {

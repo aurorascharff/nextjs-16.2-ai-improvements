@@ -58,6 +58,24 @@ command errors without an open session.
 
 ---
 
+## Keep the user in the loop visually
+
+During debug sessions, use `preview` liberally so the user can see what
+you see. Good moments to preview:
+
+- Right after opening a page or navigating, so the user confirms you're
+  on the right page.
+- After making a code change and reloading — show the before/after.
+- When inspecting the PPR shell (locked state) — the user can judge
+  shell quality faster than reading a tree dump.
+- When something looks wrong — show it, don't just describe it.
+
+Use captions to annotate what the screenshot represents (e.g.
+`preview "PPR shell — locked"`, `preview "After fix"`). This makes
+the preview window self-documenting as you iterate.
+
+---
+
 ## Commands
 
 ### `open <url> [--cookies-json <file>]`
@@ -84,7 +102,8 @@ Close browser and kill daemon.
 
 ### `goto <url>`
 
-Full-page navigation (new document load). Server renders fresh.
+Navigate to a URL with a fresh server render. The browser loads a new
+document — equivalent to typing a URL in the address bar.
 
 ```
 $ next-browser goto http://localhost:3024/vercel/~/deployments
@@ -93,7 +112,9 @@ $ next-browser goto http://localhost:3024/vercel/~/deployments
 
 ### `push [path]`
 
-Client-side navigation via `next.router.push()`. Without a path, shows an interactive picker of all links (↑/↓, enter).
+Client-side navigation — the page transitions without a full reload, the
+way a user clicks a link in the app. Without a path, shows an interactive
+picker of all links on the current page.
 
 ```
 $ next-browser push /vercel/~/deployments
@@ -104,44 +125,81 @@ If push fails silently (URL unchanged), the route wasn't prefetched.
 
 ### `back`
 
-Browser back button.
+Go back one page in browser history.
 
 ### `reload`
 
-Hard reload current page.
+Reload the current page from the server.
 
-### `capture-goto [url]`
+### `ssr lock`
 
-Lock PPR, navigate to the URL, screenshot the shell, unlock, then screenshot
-frames every ~150ms as the page hydrates and loads data. Stops after 3s of no
-visual change (hard timeout 30s). Returns a directory of PNGs.
+Block external scripts on all subsequent navigations. While locked, every
+`goto`, `push`, `back`, and `reload` shows the raw server-rendered HTML
+without React hydration or client-side JavaScript — what search engines
+and social crawlers see.
 
 ```
-$ next-browser capture-goto http://localhost:3024/vercel/~/deployments
-12 frames → /tmp/next-browser-capture-goto-1710000000000
-
-frame-0000.png is the PPR shell. Remaining frames capture hydration → data.
+$ next-browser ssr lock
+ssr locked — external scripts blocked on all navigations
 ```
 
-Frame 0 is always the PPR shell (static HTML before hydration). The remaining
-frames show the transition through hydration and dynamic data loading. Read
-them with the Read tool to see the visual progression.
+### `ssr unlock`
 
-Without a URL argument, captures the current page (re-navigates to it).
+Re-enable external scripts. The next navigation will load normally with
+full hydration.
+
+```
+$ next-browser ssr unlock
+ssr unlocked — external scripts re-enabled
+```
+
+
+### `perf [url]`
+
+Profile a full page load — reloads the current page (or navigates to a
+URL) and collects Core Web Vitals and React hydration timing in one pass.
+
+```
+$ next-browser perf http://localhost:3000/dashboard
+# Page Load Profile — http://localhost:3000/dashboard
+
+## Core Web Vitals
+  TTFB                   42ms
+  LCP               1205.3ms (img: /_next/image?url=...)
+  CLS                    0.03
+
+## React Hydration — 65.5ms (466.2ms → 531.7ms)
+  Hydrated                         65.5ms  (466.2 → 531.7)
+  Commit                            2.0ms  (531.7 → 533.7)
+  Waiting for Paint                 3.0ms  (533.7 → 536.7)
+  Remaining Effects                 4.1ms  (536.7 → 540.8)
+
+## Hydrated components (42 total, sorted by duration)
+  DeploymentsProvider                       8.3ms
+  NavigationProvider                        5.1ms
+  ...
+```
+
+**TTFB** — server response time (Navigation Timing API).
+**LCP** — when the largest visible element painted, plus what it was.
+**CLS** — cumulative layout shift score (lower is better).
+**Hydration** — React reconciler phases and per-component cost (requires
+React profiling build / `next dev`; production strips `console.timeStamp`).
+
+Without a URL, reloads the current page. With a URL, navigates there first.
 
 ### `restart-server`
 
-Restart the Next.js dev server (POSTs to `/__nextjs_restart_dev`).
-Clears filesystem cache, forces clean recompile. Polls until the server
-has a new execution ID, then reloads the page.
+Restart the Next.js dev server and clear its caches. Forces a clean
+recompile from scratch.
 
 Last resort. HMR picks up code changes on its own — reach for this only
 when you have evidence the dev server is wedged (stale output after edits,
 builds that never finish, errors that don't clear).
 
-`restart-server` often exits with `net::ERR_ABORTED` — this is expected
-(the page detaches during restart). Follow up with `goto <url>` to
-re-navigate after the server is back. Don't treat this error as a failure.
+Often exits with `net::ERR_ABORTED` — this is expected (the page detaches
+during restart). Follow up with `goto <url>` to re-navigate after the
+server is back. Don't treat this error as a failure.
 
 ---
 
@@ -150,12 +208,12 @@ re-navigate after the server is back. Don't treat this error as a failure.
 **Prerequisite:** PPR requires `cacheComponents` to be enabled in
 `next.config`. Without it the shell won't have pre-rendered content to show.
 
-Enter PPR instant-navigation mode. Sets the `next-instant-navigation-testing`
-cookie. After this:
-- `goto` — server sends raw PPR shell (static HTML with `<template>` holes).
-  No hydration — what you see is server HTML only.
-- `push` — Next.js router blocks dynamic data writes, shows prefetched shell.
-  Requires the current page to already be hydrated (prefetch is client-side),
+Freeze dynamic content so you can inspect the static shell — the part of
+the page that's instantly available before any data loads. After locking:
+- `goto` — shows the server-rendered shell with holes where dynamic
+  content would appear.
+- `push` — shows what the client already has from prefetching. Requires
+  the current page to already be hydrated (prefetch is client-side),
   so lock *after* you've landed on the origin, not before.
 
 ```
@@ -165,15 +223,10 @@ locked
 
 ### `ppr unlock`
 
-Exit PPR mode and print the shell analysis. The output can be very large
-(hundreds of boundaries). Pipe through `| head -20` if you only need the
-summary line and the dynamic holes.
-
-Captures:
-1. Locked snapshot — which boundaries are suspended = holes in the shell
-2. Releases the lock, waits for boundaries to settle
-3. Unlocked snapshot — what blocked each boundary (suspendedBy)
-4. Matches them, prints Dynamic holes / Static
+Resume dynamic content and print a shell analysis — which Suspense
+boundaries were holes in the shell, what blocked them, and which were
+static. The output can be very large (hundreds of boundaries). Pipe
+through `| head -20` if you only need the summary and dynamic holes.
 
 ```
 $ next-browser ppr unlock
@@ -182,15 +235,24 @@ unlocked
 # PPR Shell Analysis
 # 131 boundaries: 3 dynamic holes, 128 static
 
-## Dynamic holes (suspended in shell)
-  Next.Metadata
-    rendered by: MetadataWrapper
-  TeamDeploymentsLayout at app/(dashboard)/[teamSlug]/.../layout.tsx:37:9
-    suspenders unknown: thrown Promise (library using throw instead of use())
-  TrackedSuspense at ../../packages/navigation-metrics/.../tracked-suspense.js:6:20
+## Summary
+- Top actionable hole: TrackedSuspense — usePathname (client-hook)
+- Suggested next step: This route segment is suspending on client hooks. Check loading.tsx first...
+- Most common root cause: usePathname (client-hook) affecting 1 boundary
+
+## Quick Reference
+| Boundary                   | Type              | Fallback source | Primary blocker           | Source                        | Suggested next step       |
+| ---                        | ---               | ---             | ---                       | ---                           | ---                       |
+| TrackedSuspense            | component         | unknown         | usePathname (client-hook) | tracked-suspense.js:6         | Push the hook-using cl... |
+| TeamDeploymentsLayout      | route-segment     | unknown         | unknown                   | layout.tsx:37                 | Inspect the nearest us... |
+| Next.Metadata              | component         | unknown         | unknown                   | unknown                       | No primary blocker was... |
+
+## Detail
+  TrackedSuspense
     rendered by: TrackedSuspense > RootLayout > AppLayout
-    blocked by:
-      - usePathname (SSR): /vercel/~/deployments awaited in <FacePopover>
+    environments: SSR
+  TeamDeploymentsLayout
+    suspenders unknown: thrown Promise (library using throw instead of use())
 
 ## Static (pre-rendered in shell)
   GeistProvider at .../geist-provider.tsx:80:9
@@ -198,8 +260,10 @@ unlocked
   ...
 ```
 
-Each hole shows: boundary name + source, `rendered by:` ownership chain,
-`blocked by:` the dynamic calls (hooks, server APIs, scripts, cache, etc.)
+The **Quick Reference** table is the main overview — boundary, blocker,
+source, and suggested fix at a glance. The **Detail** section only appears
+for holes that have extra info (owner chains, environments, secondary
+blockers) not already in the table.
 
 **`errors` doesn't report while locked.** If the shell looks wrong (empty,
 bailed to CSR), unlock and `goto` the page normally, then run `errors`.
@@ -214,7 +278,8 @@ and `logs` to find the root cause.
 
 ### `tree`
 
-Full React component tree (via DevTools `flushInitialOperations`).
+Full React component tree — every component on the page with its
+hierarchy, like the Components panel in React DevTools.
 
 ```
 $ next-browser tree
@@ -274,21 +339,156 @@ command to change dimensions.
 
 ---
 
+### `preview [caption] [--clear]`
+
+Take a screenshot and pop it open in a separate headed Chromium window.
+**Images accumulate** — each call appends a new captioned screenshot
+below the previous ones, separated by a divider. Use `--clear` to reset
+and start fresh. The preview window is closed automatically when you run
+`close`.
+
+```
+$ next-browser preview "Before fix"
+preview → /var/folders/.../next-browser-1772770369495.png
+
+$ next-browser preview "After fix"
+preview → /var/folders/.../next-browser-1772770369496.png
+# Window now shows both images stacked vertically
+
+$ next-browser preview --clear "Fresh start"
+preview → /var/folders/.../next-browser-1772770369497.png
+# Window reset — only shows this image
+```
+
 ### `screenshot`
 
-Full-page PNG to a temp file. Returns the path. Read with the Read tool.
+Viewport PNG to a temp file. Returns the path. Read with the Read tool.
+Use `--full-page` to capture the entire scrollable page.
 
 ```
 $ next-browser screenshot
 /var/folders/.../next-browser-1772770369495.png
+
+$ next-browser screenshot --full-page
+/var/folders/.../next-browser-1772770369496.png
 ```
+
+**Always follow `screenshot` with `preview` + a caption** so the user
+can see what you see. `screenshot` alone only saves a file — the user
+has no visibility into what you captured unless you `preview` it.
+
+**For before/after comparison**, call `preview "Before"` on the original
+state, then make changes and call `preview "After"`. Both images stay
+visible in the preview window. Use `--clear` when starting a new
+comparison to reset accumulated images.
 
 Don't narrate what the screenshot shows — the user can see the browser.
 State your conclusion or next action, not a description of the page.
 
-### `eval <script>`
+**Prefer `snapshot` over `screenshot`** when you need to understand
+what's on the page or decide what to interact with. `snapshot`
+returns structured, semantic data (roles, names, state) that you can act
+on directly — screenshots are pixels you have to interpret. Use
+`screenshot` only when visual layout matters (CSS issues, verifying
+appearance, PPR shell inspection).
+
+### `snapshot`
+
+Snapshot the page's accessibility tree — the semantic structure a screen
+reader sees — with `[ref=eN]` markers on every interactive element. Use
+this to discover what's on the page before clicking.
+
+```
+$ next-browser snapshot
+- navigation "Main"
+  - link "Home" [ref=e0]
+  - link "Dashboard" [ref=e1]
+- main
+  - heading "Settings"
+  - tablist
+    - tab "General" [ref=e2] (selected)
+    - tab "Security" [ref=e3]
+  - region "Profile"
+    - textbox "Username" [ref=e4]
+    - button "Save" [ref=e5]
+```
+
+The tree shows headings, landmarks (`navigation`, `main`, `region`), and
+state (`selected`, `checked`, `expanded`, `disabled`) so you understand
+page layout, not just a flat element list.
+
+Refs are ephemeral — they reset on every `snapshot` call and are
+invalid after navigation. Re-run `snapshot` after `goto`/`push`.
+
+### `click <ref|text|selector>`
+
+Click an element using real pointer events (`pointerdown → mousedown →
+pointerup → mouseup → click`). This works with libraries that ignore
+synthetic `.click()` (Radix UI, Headless UI, etc.).
+
+Three ways to target:
+
+| Input            | Example                | How it resolves                       |
+| ---              | ---                    | ---                                   |
+| Ref from tree    | `click e3`             | Looks up role+name from last snapshot |
+| Plain text       | `click "Security"`     | Playwright `text=Security` selector   |
+| Playwright selector | `click "#submit-btn"` | Used as-is (CSS, `role=`, etc.)    |
+
+**Recommended workflow:** run `snapshot` first, then `click eN`.
+Refs are the most reliable — they resolve via ARIA role+name, so they
+work even when elements have no stable CSS selector.
+
+**Clicking navigation links can timeout.** `click` on a Next.js `<Link>`
+waits for the navigation to settle, which can exceed the command timeout.
+If `click` hangs on a nav link, cancel it and use `goto <url>` instead.
+
+```
+$ next-browser snapshot
+- tablist
+  - tab "General" [ref=e0] (selected)
+  - tab "Security" [ref=e1]
+$ next-browser click e1
+clicked
+$ next-browser snapshot
+- tablist
+  - tab "General" [ref=e0]
+  - tab "Security" [ref=e1] (selected)
+```
+
+### `fill <ref|selector> <value>`
+
+Fill a text input or textarea. Clears existing content, then types the
+new value — dispatches all the events React and other frameworks expect.
+
+```
+$ next-browser snapshot
+- textbox "Username" [ref=e4]
+$ next-browser fill e4 "judegao"
+filled
+```
+
+### `eval [ref] <script>` · `eval [ref] --file <path>` · `eval -`
 
 Run JS in page context. Returns the result as JSON.
+
+**With a ref**, the script receives the DOM element as its argument —
+useful for inspecting a snapshot node or bridging to React internals:
+
+```
+$ next-browser eval e0 'el => el.tagName'
+"BUTTON"
+
+$ next-browser eval e0 'el => {
+  const key = Object.keys(el).find(k => k.startsWith("__reactFiber$"));
+  if (!key) return null;
+  let fiber = el[key];
+  while (fiber && typeof fiber.type !== "function") fiber = fiber.return;
+  return fiber?.type?.displayName || fiber?.type?.name || null;
+}'
+"LoginButton"
+```
+
+**For simple one-liners** (no ref), pass the script inline:
 
 ```
 $ next-browser eval 'document.title'
@@ -296,15 +496,25 @@ $ next-browser eval 'document.title'
 
 $ next-browser eval 'document.querySelectorAll("a[href]").length'
 47
-
-$ next-browser eval 'document.querySelector("nextjs-portal")?.shadowRoot?.querySelector("[data-nextjs-dialog]")?.textContent'
-"Runtime ErrorCall Stack 6..."
 ```
 
-Use this to read the Next.js error overlay (it's in shadow DOM).
+**For multi-line or quote-heavy scripts**, use `--file` (or `-f`) to avoid
+shell quoting issues entirely:
 
-For multi-statement code that uses `return`, wrap in an IIFE:
-`next-browser eval '(() => { const els = ...; return els.length; })()'`
+```bash
+cat > /tmp/nb-eval.js << 'SCRIPT'
+(() => {
+  // your JS here — no shell escaping needed
+  return someResult;
+})()
+SCRIPT
+next-browser eval --file /tmp/nb-eval.js
+```
+
+You can also pipe via stdin: `echo 'document.title' | next-browser eval -`
+
+Use this to read the Next.js error overlay (it's in shadow DOM):
+`next-browser eval 'document.querySelector("nextjs-portal")?.shadowRoot?.querySelector("[data-nextjs-dialog]")?.textContent'`
 
 `eval` runs synchronously in page context — top-level `await` is not
 supported. Wrap in an async IIFE if you need to await:
@@ -314,7 +524,7 @@ supported. Wrap in an async IIFE if you need to await:
 
 ### `errors`
 
-Build and runtime errors from the Next.js dev server MCP.
+Build and runtime errors for the current page.
 
 ```
 $ next-browser errors
@@ -344,7 +554,7 @@ $ next-browser errors
 
 ### `logs`
 
-Recent dev server log output (NDJSON from `.next/dev/logs/`).
+Recent dev server log output.
 
 ```
 $ next-browser logs
@@ -400,7 +610,8 @@ response body:
 
 ### `page`
 
-Route segments for the current URL (via Next.js MCP).
+Route segments for the current URL — which layouts, pages, and
+boundaries are active.
 
 ```
 $ next-browser page
@@ -469,8 +680,9 @@ monolithic loading state, not the page.
 A meaningful shell is the real component tree with small, local fallbacks
 where data is genuinely pending. Getting there means the composition layer
 — the layouts and wrappers between those leaf boundaries — can't itself
-suspend. `ppr unlock` names what suspended (`blocked by:`) and where it
-sits (`rendered by:`). A suspend high in the tree is what collapses
+suspend. `ppr unlock`'s Quick Reference table names the primary blocker
+and source for each hole; the Detail section adds owner chains and
+secondary blockers. A suspend high in the tree is what collapses
 everything beneath it into one fallback.
 
 Work it top-down. For the component that's suspending: can the dynamic

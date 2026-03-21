@@ -49,7 +49,9 @@ if (cmd === "ppr" && arg === "lock") {
 
 if (cmd === "ppr" && arg === "unlock") {
   const res = await send("unlock");
-  exit(res, res.ok && res.data ? `unlocked\n\n${res.data}` : "unlocked");
+  const d = res.ok ? (res.data as { text?: string } | string | null) : null;
+  const text = typeof d === "string" ? d : d?.text ?? "";
+  exit(res, res.ok ? `unlocked${text ? `\n\n${text}` : ""}` : "unlocked");
 }
 
 if (cmd === "reload") {
@@ -57,16 +59,56 @@ if (cmd === "reload") {
   exit(res, res.ok ? `reloaded → ${res.data}` : "");
 }
 
-if (cmd === "capture-goto") {
-  const res = await send("capture-goto", arg ? { url: arg } : {});
+if (cmd === "perf") {
+  const res = await send("perf", arg ? { url: arg } : {});
   if (!res.ok) exit(res, "");
-  const data = res.data as { dir: string; frames: number };
-  exit(
-    res,
-    `${data.frames} frames → ${data.dir}\n` +
-      "\n" +
-      "frame-0000.png is the PPR shell. Remaining frames capture hydration → data.",
-  );
+  const d = res.data as {
+    url: string;
+    ttfb: number | null;
+    lcp: { startTime: number; size: number; element: string | null; url: string | null } | null;
+    cls: { score: number; entries: { value: number; startTime: number }[] };
+    hydration: { startTime: number; endTime: number; duration: number } | null;
+    phases: { label: string; startTime: number; endTime: number; duration: number }[];
+    hydratedComponents: { name: string; startTime: number; endTime: number; duration: number }[];
+  };
+  const lines: string[] = [`# Page Load Profile — ${d.url}`, ""];
+
+  // Core Web Vitals
+  lines.push("## Core Web Vitals");
+  const ttfbStr = d.ttfb != null ? `${d.ttfb}ms` : "—";
+  lines.push(`  TTFB              ${ttfbStr.padStart(10)}`);
+  if (d.lcp) {
+    const lcpLabel = d.lcp.element ? ` (${d.lcp.element}${d.lcp.url ? `: ${d.lcp.url.slice(0, 60)}` : ""})` : "";
+    lines.push(`  LCP               ${String(d.lcp.startTime + "ms").padStart(10)}${lcpLabel}`);
+  } else {
+    lines.push(`  LCP                        —`);
+  }
+  lines.push(`  CLS               ${String(d.cls.score).padStart(10)}`);
+  lines.push("");
+
+  // React Hydration
+  if (d.hydration) {
+    lines.push(`## React Hydration — ${d.hydration.duration}ms (${d.hydration.startTime}ms → ${d.hydration.endTime}ms)`);
+  } else {
+    lines.push("## React Hydration — no data (requires profiling build)");
+  }
+  if (d.phases.length > 0) {
+    for (const p of d.phases) {
+      lines.push(`  ${p.label.padEnd(28)} ${String(p.duration + "ms").padStart(10)}  (${p.startTime} → ${p.endTime})`);
+    }
+    lines.push("");
+  }
+  if (d.hydratedComponents.length > 0) {
+    lines.push(`## Hydrated components (${d.hydratedComponents.length} total, sorted by duration)`);
+    const top = d.hydratedComponents.slice(0, 30);
+    for (const c of top) {
+      lines.push(`  ${c.name.padEnd(40)} ${String(c.duration + "ms").padStart(10)}`);
+    }
+    if (d.hydratedComponents.length > 30) {
+      lines.push(`  ... and ${d.hydratedComponents.length - 30} more`);
+    }
+  }
+  exit(res, lines.join("\n"));
 }
 
 if (cmd === "restart-server") {
@@ -96,22 +138,91 @@ if (cmd === "goto") {
   exit(res, res.ok ? `→ ${res.data}` : "");
 }
 
+if (cmd === "ssr" && arg === "lock") {
+  const res = await send("ssr-lock");
+  exit(res, "ssr locked — external scripts blocked on all navigations");
+}
+
+if (cmd === "ssr" && arg === "unlock") {
+  const res = await send("ssr-unlock");
+  exit(res, "ssr unlocked — external scripts re-enabled");
+}
+
+
 if (cmd === "back") {
   const res = await send("back");
   exit(res, "back");
 }
 
+if (cmd === "preview") {
+  const clear = args.includes("--clear");
+  const caption = args.filter((a) => a !== "--clear").slice(1).join(" ") || undefined;
+  const res = await send("preview", { caption, clear });
+  exit(res, res.ok ? `preview → ${res.data}` : "");
+}
+
 if (cmd === "screenshot") {
-  const res = await send("screenshot");
+  const fullPage = args.includes("--full-page");
+  const res = await send("screenshot", { fullPage });
   exit(res, res.ok ? String(res.data) : "");
 }
 
-if (cmd === "eval") {
+if (cmd === "snapshot") {
+  const res = await send("snapshot");
+  exit(res, res.ok ? json(res.data) : "");
+}
+
+if (cmd === "click") {
   if (!arg) {
-    console.error("usage: next-browser eval <script>");
+    console.error("usage: next-browser click <ref|text|selector>");
     process.exit(1);
   }
-  const res = await send("eval", { script: arg });
+  const res = await send("click", { selector: arg });
+  exit(res, "clicked");
+}
+
+if (cmd === "fill") {
+  const value = args[2];
+  if (!arg || value === undefined) {
+    console.error("usage: next-browser fill <ref|selector> <value>");
+    process.exit(1);
+  }
+  const res = await send("fill", { selector: arg, value });
+  exit(res, "filled");
+}
+
+if (cmd === "eval") {
+  // Check if first arg is a ref (e.g. "e3") — if so, second arg is the script
+  let ref: string | undefined;
+  let scriptArg = arg;
+  let fileArgIdx = 2;
+  if (arg && /^e\d+$/.test(arg)) {
+    ref = arg;
+    scriptArg = args[2];
+    fileArgIdx = 3;
+  }
+
+  let script: string | undefined;
+  if (scriptArg === "--file" || scriptArg === "-f") {
+    const filePath = args[fileArgIdx];
+    if (!filePath) {
+      console.error("usage: next-browser eval [ref] --file <path>");
+      process.exit(1);
+    }
+    script = readFileSync(filePath, "utf-8");
+  } else if (scriptArg === "-") {
+    // Read from stdin
+    const chunks: Buffer[] = [];
+    for await (const chunk of process.stdin) chunks.push(chunk);
+    script = Buffer.concat(chunks).toString("utf-8");
+  } else {
+    script = scriptArg;
+  }
+  if (!script) {
+    console.error("usage: next-browser eval [ref] <script>\n       next-browser eval [ref] --file <path>\n       echo 'script' | next-browser eval -");
+    process.exit(1);
+  }
+  const res = await send("eval", { script, ...(ref ? { selector: ref } : {}) });
   exit(res, res.ok ? json(res.data) : "");
 }
 
@@ -244,10 +355,12 @@ function printUsage() {
       "  close              close browser and daemon\n" +
       "\n" +
       "  goto <url>         full-page navigation (new document load)\n" +
+      "  ssr lock           block external scripts on all navigations\n" +
+      "  ssr unlock         re-enable external scripts\n" +
       "  push [path]        client-side navigation (interactive picker if no path)\n" +
       "  back               go back in history\n" +
       "  reload             reload current page\n" +
-      "  capture-goto [url]   capture loading sequence (PPR shell → hydration → data)\n" +
+      "  perf [url]         profile page load (CWVs + React hydration timing)\n" +
       "  restart-server     restart the Next.js dev server (clears fs cache)\n" +
       "\n" +
       "  ppr lock           enter PPR instant-navigation mode\n" +
@@ -257,8 +370,14 @@ function printUsage() {
       "  tree <id>          inspect component (props, hooks, state, source)\n" +
       "\n" +
       "  viewport [WxH]     show or set viewport size (e.g. 1280x720)\n" +
-      "  screenshot         save full-page screenshot to tmp file\n" +
-      "  eval <script>      evaluate JS in page context\n" +
+      "  preview [caption] [--clear]  screenshot + open in viewer (accumulates)\n" +
+      "  screenshot [--full-page]  save screenshot to tmp file\n" +
+      "  snapshot           accessibility tree with interactive refs\n" +
+      "  click <ref|sel>    click an element (real pointer events)\n" +
+      "  fill <ref|sel> <v> fill a text input\n" +
+      "  eval [ref] <script> evaluate JS in page context\n" +
+      "  eval --file <path> evaluate JS from a file\n" +
+      "  eval -             evaluate JS from stdin\n" +
       "\n" +
       "  errors             show build/runtime errors\n" +
       "  logs               show recent dev server log output\n" +
